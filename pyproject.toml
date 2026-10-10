@@ -3,12 +3,24 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "probe-harness"
+name = "replacement"
 version = "0.1.0"
-description = "Sondeo reproducible y registro fiel del servicio original de la caja negra"
+description = "Base remota autenticada del reemplazo con mensajes provisionales"
 readme = "README.md"
-requires-python = ">=3.11"
-dependencies = []
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "flask>=3.0,<4.0",
+    "gunicorn>=21.0,<24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0,<9.0",
+]
 
 [tool.setuptools]
-packages = ["probe_harness"]
+packages = ["replacement", "probe_harness"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
