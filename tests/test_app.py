@@ -7,6 +7,7 @@ import socket
 import pytest
 
 from replacement.app import create_app
+from replacement.control import control_for
 from replacement.references import load_catalog, unavailable_catalog
 from replacement.settings import Settings
 
@@ -69,8 +70,73 @@ KNOWN_VALID_CONTROLS = (
 @pytest.mark.parametrize("message", KNOWN_VALID_CONTROLS)
 def test_msg_valid_control_preserves_stub(client, message):
     response = client.post("/msg", headers=AUTH, json={"m": message})
-    assert response.status_code == 503
-    assert response.get_data(as_text=True) == "aún no disponible"
+    if message.startswith("TRANSFER;"):
+        assert response.status_code == 503
+        assert response.get_data(as_text=True) == "aún no disponible"
+    elif message.startswith("PING;"):
+        assert response.status_code == 200
+    else:
+        assert response.status_code in (200, 201, 400, 404)
+
+
+def _message(command: str) -> str:
+    return f"{command};{control_for(command)}"
+
+
+def test_account_deposit_query_annul_flow(client):
+    alta = client.post("/msg", headers=AUTH, json={"m": _message("ALTA;Lucia")})
+    assert (alta.status_code, alta.get_json()) == (201, {"cuentaId": "AC-0001"})
+    deposito = client.post("/msg", headers=AUTH, json={"m": _message("DEPOSITO;AC-0001;500000")})
+    assert (deposito.status_code, deposito.get_json()) == (200, {"status": "recieved", "operacionId": "OP-0001"})
+    consulta = client.post("/msg", headers=AUTH, json={"m": _message("CONSULTA;AC-0001")})
+    assert consulta.get_json() == {"cuenta_id": "AC-0001", "saldo": "5000.00"}
+    anula = client.post("/msg", headers=AUTH, json={"m": _message("ANULA;OP-0001")})
+    assert anula.get_json() == {"ok": True, "anulada": "OP-0001"}
+    consulta = client.post("/msg", headers=AUTH, json={"m": _message("CONSULTA;AC-0001")})
+    assert consulta.get_json() == {"cuenta_id": "AC-0001", "saldo": "0.00"}
+
+
+def test_transfer_has_no_effect_or_operation_id(client):
+    alta = client.post("/msg", headers=AUTH, json={"m": _message("ALTA;Lucia")})
+    assert alta.status_code == 201
+    transfer = client.post("/msg", headers=AUTH, json={"m": _message("TRANSFER;AC-0001;AC-0001;100000")})
+    assert (transfer.status_code, transfer.get_data(as_text=True)) == (503, "aún no disponible")
+    deposito = client.post("/msg", headers=AUTH, json={"m": _message("DEPOSITO;AC-0001;1")})
+    assert deposito.get_json()["operacionId"] == "OP-0001"
+
+
+def test_rejected_twenty_digit_deposit_has_no_effect_or_operation_id(client):
+    client.post("/msg", headers=AUTH, json={"m": _message("ALTA;Lucia")})
+    rejected = client.post(
+        "/msg", headers=AUTH,
+        json={"m": _message("DEPOSITO;AC-0001;99999999999999999999")},
+    )
+    assert (rejected.status_code, rejected.get_json()) == (
+        400, {"error": "E303", "mensaje": "monto inválido"}
+    )
+    balance = client.post("/msg", headers=AUTH, json={"m": _message("CONSULTA;AC-0001")})
+    assert balance.get_json() == {"cuenta_id": "AC-0001", "saldo": "0.00"}
+    accepted = client.post("/msg", headers=AUTH, json={"m": _message("DEPOSITO;AC-0001;1000000000")})
+    assert (accepted.status_code, accepted.get_json()) == (
+        200, {"status": "recieved", "operacionId": "OP-0001"}
+    )
+
+
+def test_rejected_twenty_digit_deposit_for_missing_account_returns_e303(client):
+    response = client.post(
+        "/msg", headers=AUTH,
+        json={"m": _message("DEPOSITO;AC-9999;99999999999999999999")},
+    )
+    assert (response.status_code, response.get_json()) == (
+        400, {"error": "E303", "mensaje": "monto inválido"}
+    )
+
+
+def test_reset_clears_state_and_counters(client):
+    client.post("/msg", headers=AUTH, json={"m": _message("ALTA;Lucia")})
+    client.post("/__reset", headers=AUTH)
+    response = client.post("/msg", headers=AUTH, json={"m": _message("ALTA;Mateo")})
+    assert response.get_json() == {"cuentaId": "AC-0001"}
 
 
 def test_msg_invalid_numeric_control_returns_e202(client):
@@ -92,6 +158,13 @@ def test_ping_any_numeric_control_returns_pong(client):
         assert response.get_json() == {"pong": True}
 
 
+@pytest.mark.parametrize("control", ["abc", "123", "１２"])
+def test_ping_malformed_control_returns_e201(client, control):
+    response = client.post("/msg", headers=AUTH, json={"m": f"PING;{control}"})
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "E201", "mensaje": "control mal formado"}
+
+
 def test_ping_extra_arity_returns_e302(client):
     response = client.post("/msg", headers=AUTH, json={"m": "PING;extra;00"})
     assert response.status_code == 400
@@ -104,6 +177,11 @@ def test_ping_single_field_uses_stub(client):
     assert response.get_data(as_text=True) == "aún no disponible"
 
 
+def test_three_digit_control_is_malformed(client):
+    response = client.post("/msg", headers=AUTH, json={"m": "ALTA;Lucia;082"})
+    assert response.get_json() == {"error": "E201", "mensaje": "control mal formado"}
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -114,10 +192,16 @@ def test_ping_single_field_uses_stub(client):
         '{"m": null}',
     ],
 )
-def test_msg_without_string_body_uses_stub(client, payload):
+def test_msg_without_string_body_uses_reference_error(client, payload):
     response = client.post("/msg", headers=AUTH, data=payload, content_type="application/json")
-    assert response.status_code == 503
-    assert response.get_data(as_text=True) == "aún no disponible"
+    if payload in ("no es json", ""):
+        assert (response.status_code, response.get_json()) == (
+            400, {"error": "E100", "mensaje": "JSON inválido"}
+        )
+    else:
+        assert (response.status_code, response.get_json()) == (
+            400, {"error": "E102", "mensaje": "falta mensaje"}
+        )
 
 
 # --- Autenticación -----------------------------------------------------------
@@ -180,7 +264,10 @@ def test_no_outbound_connections(client, monkeypatch):
     monkeypatch.setattr(socket, "create_connection", _fail)
 
     assert client.get("/health", headers=AUTH).status_code == 200
-    assert client.post("/msg", headers=AUTH, data="{}", content_type="application/json").status_code == 503
+    response = client.post("/msg", headers=AUTH, data="{}", content_type="application/json")
+    assert (response.status_code, response.get_json()) == (
+        400, {"error": "E102", "mensaje": "falta mensaje"}
+    )
 
 
 # --- Base no lista -----------------------------------------------------------

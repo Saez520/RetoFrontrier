@@ -1,14 +1,4 @@
-"""Aplicación WSGI del reemplazo.
-
-La autenticación se evalúa antes del ruteo y clasifica cada solicitud como
-``valid``, ``missing`` o ``invalid`` sin revelar el valor recibido. Con el
-catálogo listo y credencial válida, ``POST /msg`` valida el control del pipeline
-genérico (``E201`` si no es numérico, ``E202`` si es numérico inválido) y trata
-``PING`` exacto como caso especial (``200 {"pong":true}`` con aridad 2, ``E302``
-con aridad mayor); un control válido conserva el texto provisional ``503`` con
-``aún no disponible``. El resto de las rutas se resuelven con la respuesta de
-referencia correspondiente.
-"""
+"""Aplicación WSGI del reemplazo con autenticación y despacho parcial de comandos."""
 
 from __future__ import annotations
 
@@ -16,6 +6,7 @@ import json
 
 from flask import Flask, Response, request
 
+from .commands import dispatch
 from .control import is_numeric, is_valid
 from .references import (
     JSON_CONTENT_TYPE,
@@ -76,31 +67,41 @@ def create_app(settings: Settings, catalog: Catalog, state: TemporaryState | Non
         return Response(STUB_BODY, status=STUB_STATUS, content_type=TEXT_CONTENT_TYPE)
 
     def message() -> Response:
-        """Valida el control del pipeline genérico; PING exacto es especial.
-
-        El comando de negocio no se ejecuta en esta fase: un control válido
-        conserva el stub ``503`` actual.
-        """
+        """Valida el mensaje y delega la ejecución al despachador parcial."""
         payload = request.get_json(silent=True)
-        if not isinstance(payload, dict) or not isinstance(payload.get("m"), str):
-            return stub()
+        if payload is None:
+            return json_error("E100", "JSON inválido")
+        if not isinstance(payload, dict) or "m" not in payload:
+            return json_error("E102", "falta mensaje")
+        if not isinstance(payload.get("m"), str):
+            return json_error("E102", "falta mensaje")
         text = payload["m"]
+        if ";" not in text:
+            if text.upper() == "PING":
+                return stub()
+            return json_error("E103", "falta control")
         fields = text.split(";")
-        if fields[0] == "PING":
+        if any(field == "" for field in fields):
+            return json_error("E104", "segmento vacío")
+        if fields[0].upper() == "PING":
+            if len(fields) > 2:
+                return json_error("E302", "aridad inválida")
             if len(fields) == 2:
+                control = fields[1]
+                if not is_numeric(control) or len(control) > 2:
+                    return json_error("E201", "control mal formado")
                 return Response(
                     '{"pong":true}', status=200, content_type=JSON_CONTENT_TYPE
                 )
-            if len(fields) > 2:
-                return json_error("E302", "aridad inválida")
             return stub()
         control = fields[-1]
         base = text.rpartition(";")[0]
-        if not is_numeric(control):
+        if not is_numeric(control) or len(control) > 2:
             return json_error("E201", "control mal formado")
         if not is_valid(base, control):
             return json_error("E202", "control inválido")
-        return stub()
+        result = dispatch(text, base_state)
+        return Response(result.body, status=result.status, content_type=result.content_type)
 
     def handle() -> Response:
         auth = classify_auth(request.headers.get("Authorization"), settings.token)
