@@ -1,0 +1,6 @@
+
+
+# Graphify outputs and local state
+graphify-out/
+.opencode/
+.env
