@@ -5,3 +5,5 @@ graphify-out/
 .opencode/
 .env
 .worktrees/
+__pycache__/
+*.pyc
