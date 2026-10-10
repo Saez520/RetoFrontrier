@@ -1,3 +1,15 @@
 {
-  "cases": []
+  "cases": [
+    {"method": "GET",  "path": "/health",  "auth": "valid",   "evidence_id": 302},
+    {"method": "GET",  "path": "/health",  "auth": "missing", "evidence_id": 314},
+    {"method": "GET",  "path": "/health",  "auth": "invalid", "evidence_id": 319},
+    {"method": "POST", "path": "/__reset", "auth": "valid",   "evidence_id": 305},
+    {"method": "POST", "path": "/__reset", "auth": "missing", "evidence_id": 315},
+    {"method": "POST", "path": "/__reset", "auth": "invalid", "evidence_id": 320},
+    {"method": "POST", "path": "/msg",     "auth": "missing", "evidence_id": 316},
+    {"method": "POST", "path": "/msg",     "auth": "invalid", "evidence_id": 321},
+    {"fallback": true, "auth": "valid",   "evidence_id": 309},
+    {"fallback": true, "auth": "missing", "evidence_id": 317},
+    {"fallback": true, "auth": "invalid", "evidence_id": 322}
+  ]
 }
