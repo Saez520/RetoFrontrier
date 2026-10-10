@@ -1,40 +1,42 @@
-"""Solver de control autónomo: éxito, sobreajuste, ambigüedad y E0."""
+"""Solver de control: función exacta ISO 7064 MOD 97-10, E0 y contrato público."""
 
 import unittest
 
 from probe_harness.control_solver import (
-    CANONICALIZERS,
-    FIT_LINES,
-    HOLDOUT_LINES,
     apply_control_vector,
+    control_for,
     extract_e0_values,
+    is_control_valid,
     solve,
 )
+from probe_harness.inventory import E0_CONTROL_BASES
 from probe_harness.models import RequestSpec
 
-FIT_BASES = [f"FIT{i:02d}" for i in range(1, 14)]
-HOLDOUT_BASES = ["PING", "ALFA", "BETA"]
+# Pares reales del catálogo de ejemplos (base, control aceptado) más las dos
+# bases de borde confirmadas contra el oráculo (r=0 → f=98; r=1 → f=97).
+KNOWN_PAIRS = (
+    ("ALTA;Lucia", 82),
+    ("ALTA;Mateo", 3),
+    ("CONSULTA;AC-0001", 14),
+    ("CONSULTA;AC-0002", 11),
+    ("CONSULTA;AC-0009", 87),
+    ("DEPOSITO;AC-0001;250000", 86),
+    ("DEPOSITO;AC-0002;700", 35),
+    ("TRANSFER;AC-0001;AC-0002;40000", 86),
+    ("TRANSFER;AC-0001;AC-0002;120000", 55),
+    ("TRANSFER;AC-0001;AC-0002;100000", 12),
+    ("TRANSFER;AC-0002;AC-0001;50000", 23),
+    ("ANULA;OP-0003", 66),
+    ("CONSULTA;AC-9964", 98),
+    ("CONSULTA;AC-9932", 97),
+)
 
 
-def metric_sum(data: bytes) -> int:
-    return sum(data) % 100
+def build_accepting_e0(values: dict) -> list:
+    """Sweep E0 sintético: por base, solo el valor dado es aceptado."""
 
-
-def build_examples(fit_controls, holdout_controls):
-    slots = [None] * 21
-    for line, base, control in zip(FIT_LINES, FIT_BASES, fit_controls):
-        slots[line] = {"n": line, "request": {"m": f"{base};{control}"}, "status": 200, "response": {}}
-    for line, base, control in zip(HOLDOUT_LINES, HOLDOUT_BASES, holdout_controls):
-        slots[line] = {"n": line, "request": {"m": f"{base};{control}"}, "status": 200, "response": {}}
-    for line in range(1, 21):
-        if slots[line] is None:
-            slots[line] = {"n": line, "request": {"m": f"SKIP{line};0"}, "status": 400, "response": {"error": "E301"}}
-    return slots[1:]
-
-
-def build_e0(holdout_values):
     records = []
-    for base, accepted in zip(HOLDOUT_BASES, holdout_values):
+    for base, accepted in values.items():
         for n in range(100):
             ok = n == accepted
             records.append(
@@ -49,38 +51,99 @@ def build_e0(holdout_values):
     return records
 
 
-class SolverAcceptTest(unittest.TestCase):
+class ExactFunctionTest(unittest.TestCase):
+    def test_known_pairs(self):
+        for base, expected in KNOWN_PAIRS:
+            self.assertEqual(control_for(base), expected, base)
+
+    def test_acceptance_matches_canonical_control(self):
+        for base, expected in KNOWN_PAIRS:
+            self.assertTrue(is_control_valid(base, expected), base)
+
+    def test_acceptance_rejects_wrong_numeric(self):
+        self.assertFalse(is_control_valid("ALTA;Lucia", 83))
+        self.assertFalse(is_control_valid("CONSULTA;AC-0009", 5))
+
+    def test_letters_case_insensitive_and_other_chars_omitted(self):
+        self.assertEqual(
+            control_for("CONSULTA;AC-0001"), control_for("consuLta;ac-0001")
+        )
+        # El separador ``;`` se omite: la misma secuencia de letras da igual S.
+        self.assertEqual(control_for("ALTA;Lucia"), control_for("ALTALucia"))
+
+
+class BorderTest(unittest.TestCase):
+    """Bordes confirmados en T0b: la aceptación es igualdad, no congruencia.
+
+    ``f`` no se reduce mod 97: r=0 da f=98 y r=1 da f=97. El gemelo mod-97
+    (1 y 0) es rechazado por el oráculo con E202.
+    """
+
+    R0_BASE = "CONSULTA;AC-9964"
+    R1_BASE = "CONSULTA;AC-9932"
+
+    def test_r0_control_is_98_and_one_is_rejected(self):
+        self.assertEqual(control_for(self.R0_BASE), 98)
+        self.assertTrue(is_control_valid(self.R0_BASE, 98))
+        self.assertFalse(is_control_valid(self.R0_BASE, 1))
+
+    def test_r1_control_is_97_and_zero_is_rejected(self):
+        self.assertEqual(control_for(self.R1_BASE), 97)
+        self.assertTrue(is_control_valid(self.R1_BASE, 97))
+        self.assertFalse(is_control_valid(self.R1_BASE, 0))
+
+
+class ImportOrderTest(unittest.TestCase):
+    """La función exacta y las bases de E0 conviven sin ciclos de importación."""
+
+    def test_both_modules_are_importable_and_consistent(self):
+        import probe_harness.control_solver as control_solver
+        import probe_harness.inventory as inventory
+
+        self.assertEqual(control_solver.control_for("ALTA;Lucia"), 82)
+        self.assertEqual(
+            tuple(inventory.E0_CONTROL_BASES), ("ALTA;Lucia", "CONSULTA;AC-0009")
+        )
+        self.assertNotIn("PING", inventory.E0_CONTROL_BASES)
+
+
+class SolveAcceptedTest(unittest.TestCase):
     def setUp(self):
-        self.fit_controls = [metric_sum(base.encode()) for base in FIT_BASES]
-        self.holdout_values = [metric_sum(base.encode()) for base in HOLDOUT_BASES]
-        self.examples = build_examples(self.fit_controls, self.holdout_values)
-        self.records = build_e0(self.holdout_values)
+        self.records = build_accepting_e0({"ALTA;Lucia": 82, "CONSULTA;AC-0009": 87})
         self.slots = [
             ("E4-01", "PING"),
             ("E5-01-01", "ALTA;E5-01-A"),
             ("E8-01-01", "CONSULTA;E8-A-01"),
         ]
-        self.canon = dict(CANONICALIZERS)["raw"]
 
-    def _solve(self, **kwargs):
-        return solve(
-            self.records,
-            self.examples,
-            self.slots,
-            metrics=[("sum", metric_sum)],
-            canonicalizers=[("raw", self.canon)],
-            **kwargs,
-        )
-
-    def test_accepted_with_unique_vector(self):
-        result = self._solve()
+    def test_accepted_and_controls_computed_with_f(self):
+        result = solve(self.records, None, self.slots)
         self.assertEqual(result.status, "accepted")
-        self.assertEqual(result.fit_count, 13)
-        self.assertEqual(result.holdout_count, 3)
-        self.assertEqual(result.provenance.a, 1)
-        self.assertEqual(result.provenance.b, 0)
-        self.assertEqual(result.controls["E4-01"], metric_sum(b"PING"))
+        self.assertEqual(result.e0_values, {"ALTA;Lucia": 82, "CONSULTA;AC-0009": 87})
+        self.assertEqual(result.controls["E4-01"], control_for("PING"))
+        self.assertEqual(result.controls["E5-01-01"], control_for("ALTA;E5-01-A"))
+        self.assertEqual(result.controls["E8-01-01"], control_for("CONSULTA;E8-A-01"))
         self.assertTrue(result.vector_fingerprint)
+
+    def test_ping_sweep_does_not_make_e0_ambiguous(self):
+        # PING acepta los 100 controles; al no ser base de validación, no
+        # contamina el veredicto.
+        records = build_accepting_e0(
+            {"ALTA;Lucia": 82, "CONSULTA;AC-0009": 87}
+        )
+        ping_accepts = [
+            {
+                "case_id": f"E0-PING-{n:02d}",
+                "request": {"m": f"PING;{n:02d}"},
+                "status": 200,
+                "response": {},
+                "infra": False,
+            }
+            for n in range(100)
+        ]
+        result = solve(records + ping_accepts, None, self.slots)
+        self.assertEqual(result.status, "accepted")
+        self.assertNotIn("PING", result.e0_values)
 
     def test_serialization_has_no_leading_zero(self):
         spec = RequestSpec(
@@ -95,91 +158,37 @@ class SolverAcceptTest(unittest.TestCase):
         self.assertEqual(body, '{"m":"PING;7"}')
 
 
-class SolverOverfitTest(unittest.TestCase):
-    def test_holdout_mismatch_is_no_candidate(self):
-        fit_controls = [metric_sum(base.encode()) for base in FIT_BASES]
-        wrong_holdout = [(metric_sum(base.encode()) + 5) % 100 for base in HOLDOUT_BASES]
-        examples = build_examples(fit_controls, wrong_holdout)
-        records = build_e0(wrong_holdout)
-        result = solve(
-            records,
-            examples,
-            [("E4-01", "PING")],
-            metrics=[("sum", metric_sum)],
-            canonicalizers=[("raw", dict(CANONICALIZERS)["raw"])],
-        )
-        self.assertEqual(result.status, "no_candidate")
-        self.assertIsNone(result.controls)
-
-
-class SolverAmbiguityTest(unittest.TestCase):
-    def test_two_vectors_is_ambiguous_candidate(self):
-        fit_controls = [metric_sum(base.encode()) for base in FIT_BASES]
-        holdout_values = [metric_sum(base.encode()) for base in HOLDOUT_BASES]
-        examples = build_examples(fit_controls, holdout_values)
-        records = build_e0(holdout_values)
-        # Ambas canonicalizaciones coinciden en bases mayúsculas, pero difieren
-        # en un prefijo con minúsculas.
-        slots = [("E4-01", "ping")]
-        result = solve(
-            records,
-            examples,
-            slots,
-            metrics=[("sum", metric_sum)],
-            canonicalizers=[
-                ("raw", dict(CANONICALIZERS)["raw"]),
-                ("ascii_upper", dict(CANONICALIZERS)["ascii_upper"]),
-            ],
-        )
-        self.assertEqual(result.status, "ambiguous_candidate")
-        self.assertIsNone(result.controls)
-
-    def test_ambiguous_e0_multiple_accepts(self):
-        records = build_e0([metric_sum(b.encode()) for b in HOLDOUT_BASES])
-        # PING acepta además el 5: dos aceptados -> ambiguous_e0.
+class SolveAmbiguityTest(unittest.TestCase):
+    def test_base_with_two_accepts_is_ambiguous(self):
+        records = build_accepting_e0({"ALTA;Lucia": 82, "CONSULTA;AC-0009": 87})
         records.append(
             {
-                "case_id": "E0-PING-05",
-                "request": {"m": "PING;05"},
+                "case_id": "E0-ALTA-90",
+                "request": {"m": "ALTA;Lucia;90"},
                 "status": 200,
                 "response": {},
                 "infra": False,
             }
         )
-        examples = build_examples(
-            [metric_sum(base.encode()) for base in FIT_BASES],
-            [metric_sum(base.encode()) for base in HOLDOUT_BASES],
-        )
-        result = solve(
-            records,
-            examples,
-            [("E4-01", "PING")],
-            metrics=[("sum", metric_sum)],
-            canonicalizers=[("raw", dict(CANONICALIZERS)["raw"])],
-        )
+        result = solve(records, None, [("E4-01", "PING")])
         self.assertEqual(result.status, "ambiguous_e0")
+        self.assertIsNone(result.controls)
 
-    def test_ambiguous_e0_zero_accepts(self):
-        # Ningún valor aceptado en el sweep de PING (todos E202).
-        records = build_e0([metric_sum(b.encode()) for b in HOLDOUT_BASES])
+    def test_base_without_accepts_is_ambiguous(self):
         records = [
             {**r, "status": 400, "response": {"error": "E202"}}
-            if r["request"]["m"].startswith("PING;")
+            if r["request"]["m"].startswith("ALTA;Lucia;")
             else r
-            for r in records
+            for r in build_accepting_e0({"ALTA;Lucia": 82, "CONSULTA;AC-0009": 87})
         ]
-        examples = build_examples(
-            [metric_sum(base.encode()) for base in FIT_BASES],
-            [metric_sum(base.encode()) for base in HOLDOUT_BASES],
-        )
-        result = solve(
-            records,
-            examples,
-            [("E4-01", "PING")],
-            metrics=[("sum", metric_sum)],
-            canonicalizers=[("raw", dict(CANONICALIZERS)["raw"])],
-        )
+        result = solve(records, None, [("E4-01", "PING")])
         self.assertEqual(result.status, "ambiguous_e0")
+
+    def test_measured_value_mismatch_is_ambiguous(self):
+        records = build_accepting_e0({"ALTA;Lucia": 83, "CONSULTA;AC-0009": 87})
+        result = solve(records, None, [("E4-01", "PING")])
+        self.assertEqual(result.status, "ambiguous_e0")
+        self.assertEqual(result.e0_values, {"ALTA;Lucia": 83})
 
 
 class E0ExtractionTest(unittest.TestCase):

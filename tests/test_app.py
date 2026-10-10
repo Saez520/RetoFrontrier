@@ -38,7 +38,7 @@ def test_health_valid_returns_reference(client):
     assert response.get_json() == {"status": "listo"}
 
 
-def test_reset_valid_is_idempotent_and_preserves_stub(client):
+def test_reset_valid_is_idempotent_and_ping_stays_special(client):
     first = client.post("/__reset", headers=AUTH)
     second = client.post("/__reset", headers=AUTH)
 
@@ -46,6 +46,60 @@ def test_reset_valid_is_idempotent_and_preserves_stub(client):
     assert first.get_json() == {"reiniciado": True}
 
     response = client.post("/msg", headers=AUTH, json={"m": "PING;64"})
+    assert response.status_code == 200
+    assert response.get_json() == {"pong": True}
+
+
+KNOWN_VALID_CONTROLS = (
+    "ALTA;Lucia;82",
+    "ALTA;Mateo;3",
+    "CONSULTA;AC-0001;14",
+    "CONSULTA;AC-0002;11",
+    "CONSULTA;AC-0009;87",
+    "DEPOSITO;AC-0001;250000;86",
+    "DEPOSITO;AC-0002;700;35",
+    "TRANSFER;AC-0001;AC-0002;40000;86",
+    "TRANSFER;AC-0001;AC-0002;120000;55",
+    "TRANSFER;AC-0001;AC-0002;100000;12",
+    "TRANSFER;AC-0002;AC-0001;50000;23",
+    "ANULA;OP-0003;66",
+)
+
+
+@pytest.mark.parametrize("message", KNOWN_VALID_CONTROLS)
+def test_msg_valid_control_preserves_stub(client, message):
+    response = client.post("/msg", headers=AUTH, json={"m": message})
+    assert response.status_code == 503
+    assert response.get_data(as_text=True) == "aún no disponible"
+
+
+def test_msg_invalid_numeric_control_returns_e202(client):
+    response = client.post("/msg", headers=AUTH, json={"m": "ALTA;Lucia;83"})
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "E202", "mensaje": "control inválido"}
+
+
+def test_msg_malformed_control_returns_e201(client):
+    response = client.post("/msg", headers=AUTH, json={"m": "DEPOSITO;AC-0002;700;5X"})
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "E201", "mensaje": "control mal formado"}
+
+
+def test_ping_any_numeric_control_returns_pong(client):
+    for control in ("00", "3", "64", "98"):
+        response = client.post("/msg", headers=AUTH, json={"m": f"PING;{control}"})
+        assert response.status_code == 200
+        assert response.get_json() == {"pong": True}
+
+
+def test_ping_extra_arity_returns_e302(client):
+    response = client.post("/msg", headers=AUTH, json={"m": "PING;extra;00"})
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "E302", "mensaje": "aridad inválida"}
+
+
+def test_ping_single_field_uses_stub(client):
+    response = client.post("/msg", headers=AUTH, json={"m": "PING"})
     assert response.status_code == 503
     assert response.get_data(as_text=True) == "aún no disponible"
 
@@ -53,13 +107,14 @@ def test_reset_valid_is_idempotent_and_preserves_stub(client):
 @pytest.mark.parametrize(
     "payload",
     [
-        '{"m": "PING;64"}',
-        '{"m": "ALTA;Lucia;83"}',
         "no es json",
         "",
+        "{}",
+        '{"m": 0}',
+        '{"m": null}',
     ],
 )
-def test_msg_valid_always_returns_stub(client, payload):
+def test_msg_without_string_body_uses_stub(client, payload):
     response = client.post("/msg", headers=AUTH, data=payload, content_type="application/json")
     assert response.status_code == 503
     assert response.get_data(as_text=True) == "aún no disponible"

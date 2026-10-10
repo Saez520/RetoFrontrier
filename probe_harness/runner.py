@@ -13,7 +13,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional
 
-from .control_solver import apply_control_vector, solve
+from .binding import IdentifierBinding
+from .control_solver import control_for, solve
 from .models import (
     KIND_EXPLORATION,
     KIND_RETRY,
@@ -44,9 +45,10 @@ DEPENDENT_AXES = {"E4", "E5", "E8"}
 class _Hooks:
     """Persiste el journal antes del envío y la evidencia después."""
 
-    def __init__(self, runner: "ProbeRunner", seq_id: str):
+    def __init__(self, runner: "ProbeRunner", seq_id: str, note=None):
         self.runner = runner
         self.seq_id = seq_id
+        self.note = note
 
     def before_send(self, meta: AttemptMeta) -> None:
         r = self.runner
@@ -77,6 +79,7 @@ class _Hooks:
             seq=meta.seq,
             attempt_of=meta.attempt_of,
             retry_index=meta.retry_index,
+            note=self.note,
         )
         r.state.pending_attempt = None
         r._save_state()
@@ -108,6 +111,7 @@ class ProbeRunner:
         self._done_case_ids: set = set()
         self._e7_times: list = []
         self._control_rejected = False
+        self._bindings: dict = {}
         self.summary: dict = {}
 
     # -- utilidades ------------------------------------------------------
@@ -182,22 +186,51 @@ class ProbeRunner:
 
     # -- envío -----------------------------------------------------------
 
-    def _body_for(self, spec) -> Optional[str]:
-        if spec.uses_control():
-            controls = self.solver_result.controls if self.solver_result else None
-            if not controls:
-                raise PersistenceError(
-                    f"sin vector de controles para {spec.case_id}"
-                )
-            return apply_control_vector(spec, controls)
-        return spec.resolved_body()
+    def _body_for(self, spec, seq_id: str):
+        """Resuelve el cuerpo y la nota de binding de una solicitud.
+
+        Los tokens de identificadores se sustituyen por los IDs reales ligados
+        en la secuencia y el control se computa sobre el mensaje final. Devuelve
+        ``(body, note)`` donde la nota describe tokens no ligados (o ``None``).
+        """
+
+        if not spec.uses_control():
+            return spec.resolved_body(), None
+        controls = self.solver_result.controls if self.solver_result else None
+        if not controls:
+            raise PersistenceError(f"sin vector de controles para {spec.case_id}")
+        prefix = spec.control_prefix
+        note = None
+        binding = self._bindings.get(seq_id)
+        if binding is not None:
+            prefix, note = binding.substitute(prefix)
+        control = control_for(prefix)
+        body = json.dumps(
+            {"m": f"{prefix};{control}"},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        return body, note
+
+    def _observe_binding(self, body: Optional[str], result, seq_id: str) -> None:
+        binding = self._bindings.get(seq_id)
+        if binding is None or body is None:
+            return
+        try:
+            message = json.loads(body).get("m")
+        except (ValueError, AttributeError):
+            return
+        response = parse_semantic(None, result.response_text)
+        binding.observe(message, response)
 
     def _send(self, spec, seq_id: str):
-        body = self._body_for(spec)
+        body, note = self._body_for(spec, seq_id)
         results = self.client.send(
-            spec, body, seq=seq_id, hooks=_Hooks(self, seq_id)
+            spec, body, seq=seq_id, hooks=_Hooks(self, seq_id, note)
         )
-        return results[-1]
+        result = results[-1]
+        self._observe_binding(body, result, seq_id)
+        return result
 
     @staticmethod
     def _is_control_rejected(spec, result) -> bool:
@@ -228,6 +261,13 @@ class ProbeRunner:
         if existing in TERMINAL_SEQUENCE_STATUSES:
             self._progress(f"{sequence_id}: omitida (estado {existing})")
             return
+        # El binding de identificadores es propio de la secuencia y arranca
+        # limpio en su reset.
+        self._bindings[sequence_id] = IdentifierBinding()
+        # Una secuencia reiniciada explícitamente (estado ``pending``) se
+        # re-ejecuta completa, sin saltar slots ya vistos: su binding debe
+        # reconstruirse desde sus propias preparaciones (ALTA/DEPOSITO/TRANSFER).
+        use_dedup = dedup and existing != "pending"
         if seq.axis in DEPENDENT_AXES:
             if self._control_rejected:
                 self._mark(sequence_id, "aborted_control_rejected", "control rechazado")
@@ -241,7 +281,7 @@ class ProbeRunner:
             if self._stopped:
                 self._mark(sequence_id, "incomplete", "detenido")
                 return
-            if dedup and spec.case_id in self._done_case_ids:
+            if use_dedup and spec.case_id in self._done_case_ids:
                 continue
             try:
                 result = self._send(spec, sequence_id)
@@ -261,7 +301,7 @@ class ProbeRunner:
         for spec in seq.steps:
             if self._stopped:
                 break
-            if dedup and spec.case_id in self._done_case_ids:
+            if use_dedup and spec.case_id in self._done_case_ids:
                 continue
             try:
                 result = self._send(spec, sequence_id)
@@ -284,7 +324,13 @@ class ProbeRunner:
     # -- solver ----------------------------------------------------------
 
     def _solve_once(self) -> None:
-        if self.state.solver_result:
+        # Solo se reutiliza un resultado persistido ya aceptado. Un estado con
+        # otro veredicto (p. ej. ``ambiguous_e0`` por una versión anterior del
+        # solver) se vuelve a resolver para no arrastrar la ambigüedad.
+        if (
+            self.state.solver_result
+            and self.state.solver_result.get("status") == "accepted"
+        ):
             self.solver_result = SolverResult.from_dict(self.state.solver_result)
             self._progress(f"solver (persistido): {self.solver_result.status}")
             return

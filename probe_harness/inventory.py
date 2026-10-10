@@ -32,6 +32,11 @@ LCG_INCREMENT = 1013904223
 # Longitudes exactas de las veinte secuencias E8 (suma 150).
 E8_LENGTHS = (2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 8, 8, 8, 8, 8, 8, 8, 8, 9)
 
+# Bases de E0 usadas para validar el control derivado. ``PING`` se excluye: es un
+# caso especial que no valida control (acepta todo control numérico), por lo que
+# su sweep no aporta evidencia de la función y deja el conjunto ambiguo.
+E0_CONTROL_BASES = ("ALTA;Lucia", "CONSULTA;AC-0009")
+
 
 def json_body(message: str) -> str:
     return json.dumps({"m": message}, ensure_ascii=False, separators=(",", ":"))

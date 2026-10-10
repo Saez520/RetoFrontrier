@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from probe_harness.inventory import E8_LENGTHS, Inventory
+from probe_harness.inventory import E0_CONTROL_BASES, E8_LENGTHS, Inventory
 
 
 def message_of(spec):
@@ -52,6 +52,10 @@ class InventoryCountsTest(unittest.TestCase):
         self.assertEqual(message_of(steps[199]), "ALTA;Lucia;99")
         self.assertEqual(message_of(steps[200]), "CONSULTA;AC-0009;00")
         self.assertEqual(message_of(steps[299]), "CONSULTA;AC-0009;99")
+
+    def test_e0_control_bases_exclude_ping(self):
+        self.assertEqual(E0_CONTROL_BASES, ("ALTA;Lucia", "CONSULTA;AC-0009"))
+        self.assertNotIn("PING", E0_CONTROL_BASES)
 
     def test_e1_table_boundaries(self):
         reqs = self.inv.e1_requests()

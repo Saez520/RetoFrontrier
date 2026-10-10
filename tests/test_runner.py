@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from probe_harness.control_solver import load_examples
+from probe_harness.control_solver import control_for, load_examples
 from probe_harness.inventory import Inventory
 from probe_harness.models import ControlProvenance, SolverResult
 from probe_harness.oracle_client import OracleClient, TransportError, TransportResponse
@@ -147,7 +147,7 @@ class OrderAndSolverTest(unittest.TestCase):
 
 
 class FallbackTest(unittest.TestCase):
-    def test_no_candidate_runs_independent_axes(self):
+    def test_ambiguous_solver_skips_dependent_axes(self):
         with tempfile.TemporaryDirectory() as tmp:
             h = RunnerHarness(tmp, no_candidate_result())
             summary = h.run()
@@ -163,13 +163,19 @@ class FallbackTest(unittest.TestCase):
             self.assertEqual(statuses["PING"]["status"], "pending_control_solver")
             self.assertEqual(statuses["E5-01"]["status"], "pending_control_solver")
             self.assertEqual(statuses["E8-01"]["status"], "pending_control_solver")
-            self.assertEqual(summary["solver"]["status"], "no_candidate")
+            # Un veredicto persistido no aceptado se vuelve a resolver: con E0
+            # ambiguo (todas las bases aceptan todo) el resultado es ambiguous_e0.
+            self.assertEqual(summary["solver"]["status"], "ambiguous_e0")
 
 
 class FailFastTest(unittest.TestCase):
     def test_e202_aborts_dependent_axes(self):
+        # El control se computa sobre el mensaje final (``PING`` → ``f``), no
+        # sobre un vector inyectado: se rechaza el primer control de PING.
+        rejected = f'{{"m":"PING;{control_for("PING")}"}}'.encode()
+
         def handler(method, url, headers, body):
-            if body == b'{"m":"PING;7"}':
+            if body == rejected:
                 return TransportResponse(400, {}, b'{"error":"E202","mensaje":"control inv\xc3\xa1lido"}')
             return TransportResponse(200, {}, b"{}")
 
@@ -190,7 +196,7 @@ class FailFastTest(unittest.TestCase):
 
 class UncertainSequenceTest(unittest.TestCase):
     def test_missing_response_stops_dependents(self):
-        target = b'{"m":"ALTA;E5-01-B;7"}'
+        target = f'{{"m":"ALTA;E5-01-B;{control_for("ALTA;E5-01-B")}"}}'.encode()
 
         def handler(method, url, headers, body):
             if body == target:
@@ -302,14 +308,14 @@ class SolveRetryPathTest(unittest.TestCase):
                     message = json.loads(body.decode("utf-8")).get("m")
                 except (ValueError, UnicodeDecodeError, AttributeError):
                     message = None
-            if message == "PING;64":
-                attempts["ping64"] = attempts.get("ping64", 0) + 1
-                if attempts["ping64"] == 1:
+            if message == "ALTA;Lucia;82":
+                attempts["alta82"] = attempts.get("alta82", 0) + 1
+                if attempts["alta82"] == 1:
                     return TransportResponse(
                         503, {"X-Frontier-Infra": "1"}, b'{"error":"down"}'
                     )
-                return TransportResponse(200, {}, b'{"pong":true}')
-            if message in ("ALTA;Lucia;82", "CONSULTA;AC-0009;87"):
+                return TransportResponse(200, {}, b"{}")
+            if message == "CONSULTA;AC-0009;87":
                 return TransportResponse(200, {}, b"{}")
             if isinstance(message, str) and ";" in message:
                 return TransportResponse(400, {}, b'{"error":"E201"}')
@@ -327,11 +333,13 @@ class SolveRetryPathTest(unittest.TestCase):
             kinds = [
                 r["kind"]
                 for r in h.recorder.read_all()
-                if r.get("case_id") == "E0-PING-64"
+                if r.get("case_id") == "E0-ALTA-82"
             ]
         self.assertIn("retry", kinds)
-        self.assertNotEqual(summary["solver"]["status"], "ambiguous_e0")
-        self.assertEqual(summary["solver"]["e0"]["PING"], 64)
+        self.assertEqual(summary["solver"]["status"], "accepted")
+        self.assertEqual(
+            summary["solver"]["e0"], {"ALTA;Lucia": 82, "CONSULTA;AC-0009": 87}
+        )
 
 
 if __name__ == "__main__":

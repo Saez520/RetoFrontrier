@@ -1,123 +1,69 @@
-"""Solver de control autónomo y cerrado.
+"""Solver de control basado en la función exacta derivada.
 
-Extrae los controles aceptados de E0, arma los conjuntos de ajuste y hold-out,
-recorre el catálogo finito de canonicalizadores, métricas y familias afines, y
-solo adopta una función cuya predicción supera ajuste y hold-out y produce un
-único vector de controles. No ejecuta solicitudes, no lee credenciales y no
-solicita valores humanos.
+La función de control es ISO 7064 MOD 97-10 sobre ``S(base)``: cada letra se
+mapea a su posición 1..26 (sin distinguir mayúsculas), cada dígito se conserva y
+cualquier otro carácter se omite. El control canónico es
+``f(base) = 98 - (N*100 % 97)`` (rango 2..98, sin reducción final mod 97) y la
+aceptación es por igualdad exacta ``int(control) == f(base)``.
+
+La congruencia ``(N*100 + control) % 97 == 1`` no describe al original: en los
+bordes ``N*100 % 97 == 0`` (f=98) y ``== 1`` (f=97) aceptaría 1 y 0, que el
+servicio rechaza con ``E202``.
+
+El solver no ejecuta solicitudes, no lee credenciales y no solicita valores
+humanos: valida la derivación contra las bases medidas en E0 y materializa los
+controles de cada slot con ``f(prefijo)``.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import zlib
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
+from .inventory import E0_CONTROL_BASES
 from .models import ControlProvenance, RequestSpec, SolverResult
-
-# Líneas de ``ejemplos.jsonl`` (1-based) que integran el ajuste y el hold-out.
-FIT_LINES = (4, 5, 6, 7, 8, 9, 10, 11, 13, 14, 16, 18, 19)
-HOLDOUT_LINES = (1, 3, 15)
 
 E0_EXCLUDED_ERRORS = ("E201", "E202")
 
-
-# --- canonicalizadores ----------------------------------------------------
-
-
-def _canon_raw(data: bytes) -> bytes:
-    return data
+# Bases del catálogo de pruebas que usan el control derivado (12 pares).
+ISO7064_MODULUS = 97
 
 
-def _canon_command_upper(data: bytes) -> bytes:
-    idx = data.find(b";")
-    head = data if idx == -1 else data[:idx]
-    tail = b"" if idx == -1 else data[idx:]
-    head = bytes(c - 32 if 0x61 <= c <= 0x7A else c for c in head)
-    return head + tail
+# --- función exacta -------------------------------------------------------
 
 
-def _canon_ascii_upper(data: bytes) -> bytes:
-    return bytes(c - 32 if 0x61 <= c <= 0x7A else c for c in data)
+def _encode_base(base: str) -> str:
+    """``S(base)``: letra→1..26 (case-insensitive), dígito→dígito, resto omitido."""
+
+    parts = []
+    for char in base:
+        if "0" <= char <= "9":
+            parts.append(char)
+        elif "A" <= char <= "Z":
+            parts.append(str(ord(char) - ord("A") + 1))
+        elif "a" <= char <= "z":
+            parts.append(str(ord(char) - ord("a") + 1))
+    return "".join(parts)
 
 
-def _canon_strip_semicolons(data: bytes) -> bytes:
-    return data.replace(b";", b"")
+def _base_number(base: str) -> int:
+    encoded = _encode_base(base)
+    return int(encoded) if encoded else 0
 
 
-CANONICALIZERS = (
-    ("raw", _canon_raw),
-    ("command_upper", _canon_command_upper),
-    ("ascii_upper", _canon_ascii_upper),
-    ("strip_semicolons", _canon_strip_semicolons),
-)
+def control_for(base: str) -> int:
+    """Control canónico ``f(base) = 98 - (N*100 % 97)`` (rango 2..98)."""
+
+    number = _base_number(base)
+    return 98 - (number * 100 % ISO7064_MODULUS)
 
 
-# --- métricas -------------------------------------------------------------
+def is_control_valid(base: str, control: int) -> bool:
+    """Aceptación por igualdad exacta: ``control == f(base)``."""
 
-
-def _crc8_msb(poly: int, init: int, xorout: int, data: bytes) -> int:
-    crc = init
-    for byte in data:
-        crc ^= byte
-        for _ in range(8):
-            if crc & 0x80:
-                crc = ((crc << 1) ^ poly) & 0xFF
-            else:
-                crc = (crc << 1) & 0xFF
-    return crc ^ xorout
-
-
-def _crc8_maxim(data: bytes) -> int:
-    crc = 0x00
-    for byte in data:
-        crc ^= byte
-        for _ in range(8):
-            if crc & 1:
-                crc = (crc >> 1) ^ 0x8C
-            else:
-                crc >>= 1
-    return crc & 0xFF
-
-
-def _xor_bytes(data: bytes) -> int:
-    value = 0
-    for byte in data:
-        value ^= byte
-    return value
-
-
-def _md5(data: bytes) -> bytes:
-    return hashlib.md5(data).digest()
-
-
-def _sha1(data: bytes) -> bytes:
-    return hashlib.sha1(data).digest()
-
-
-def _sha256(data: bytes) -> bytes:
-    return hashlib.sha256(data).digest()
-
-
-CATALOG_METRICS = (
-    ("sum", lambda b: sum(b) % 100),
-    ("sum256", lambda b: (sum(b) % 256) % 100),
-    ("xor", lambda b: _xor_bytes(b) % 100),
-    ("crc8_atm", lambda b: _crc8_msb(0x07, 0x00, 0x00, b) % 100),
-    ("crc8_sae_j1850", lambda b: _crc8_msb(0x1D, 0xFF, 0xFF, b) % 100),
-    ("crc8_maxim", lambda b: _crc8_maxim(b) % 100),
-    ("crc32", lambda b: zlib.crc32(b) % 100),
-    ("adler32", lambda b: zlib.adler32(b) % 100),
-    ("md5_first", lambda b: _md5(b)[0] % 100),
-    ("md5_last", lambda b: _md5(b)[-1] % 100),
-    ("sha1_first", lambda b: _sha1(b)[0] % 100),
-    ("sha1_last", lambda b: _sha1(b)[-1] % 100),
-    ("sha256_first", lambda b: _sha256(b)[0] % 100),
-    ("sha256_last", lambda b: _sha256(b)[-1] % 100),
-)
+    return control == control_for(base)
 
 
 # --- carga de ejemplos ----------------------------------------------------
@@ -196,117 +142,65 @@ def _vector_fingerprint(vector: list) -> str:
 
 def solve(
     e0_records: list,
-    examples: list,
-    slots: list,
+    examples: Optional[list] = None,
+    slots: Optional[list] = None,
     *,
-    metrics=CATALOG_METRICS,
-    canonicalizers=CANONICALIZERS,
+    validation_bases: tuple = E0_CONTROL_BASES,
 ) -> SolverResult:
-    """Deriva el vector de controles o reporta la causa exacta de no derivación."""
+    """Deriva el vector de controles o reporta la causa exacta de no derivación.
 
-    pairs = example_pairs(examples)
-    expected = {}
-    for line in HOLDOUT_LINES:
-        if line in pairs:
-            base, control = pairs[line]
-            expected[base] = control
-    fit = [pairs[line] for line in FIT_LINES if line in pairs]
-    holdout = [pairs[line] for line in HOLDOUT_LINES if line in pairs]
+    ``examples`` se acepta por compatibilidad de contrato y no interviene: la
+    función de control es fija y no se ajusta a partir del catálogo.
+    """
+
+    if slots is None:
+        slots = []
 
     grouped = extract_e0_values(e0_records)
     e0_values = {}
-    for base, expect in expected.items():
-        accepted = grouped.get(base, set())
-        if len(accepted) != 1:
+    for base in validation_bases:
+        measured = grouped.get(base, set())
+        if len(measured) != 1:
             return SolverResult(
                 status="ambiguous_e0",
                 provenance=None,
-                fit_count=len(fit),
-                holdout_count=len(holdout),
+                fit_count=len(validation_bases),
+                holdout_count=0,
                 e0_values={},
                 vector_fingerprint=None,
                 controls=None,
-                reason=f"{base}: {len(accepted)} controles aceptados en E0",
+                reason=f"{base}: {len(measured)} controles aceptados en E0",
             )
-        (value,) = tuple(accepted)
-        if value != expect:
+        (value,) = tuple(measured)
+        expected = control_for(base)
+        if value != expected:
             return SolverResult(
                 status="ambiguous_e0",
                 provenance=None,
-                fit_count=len(fit),
-                holdout_count=len(holdout),
+                fit_count=len(validation_bases),
+                holdout_count=0,
                 e0_values={base: value},
                 vector_fingerprint=None,
                 controls=None,
-                reason=f"{base}: E0={value} difiere del ejemplo {expect}",
+                reason=f"{base}: E0={value} difiere de f={expected}",
             )
         e0_values[base] = value
 
-    all_bases = {base for base, _ in fit}
-    all_bases.update(base for base, _ in holdout)
-    all_bases.update(prefix for _, prefix in slots)
-
-    vectors = []
-    provenance = None
-    for canon_name, canon in canonicalizers:
-        canon_cache = {base: canon(base.encode("utf-8")) for base in all_bases}
-        encoded = {base: canon_cache[base] for base in all_bases}
-        for metric_name, metric in metrics:
-            fit_values = [metric(encoded[base]) for base, _ in fit]
-            if not fit:
-                continue
-            for a in range(100):
-                avs = [(a * v) % 100 for v in fit_values]
-                b = (fit[0][1] - avs[0]) % 100
-                if not all((avs[i] + b) % 100 == fit[i][1] for i in range(1, len(fit))):
-                    continue
-                if not all(
-                    (a * metric(encoded[base]) + b) % 100 == control
-                    for base, control in holdout
-                ):
-                    continue
-                vector = [
-                    (case_id, (a * metric(encoded[prefix]) + b) % 100)
-                    for case_id, prefix in slots
-                ]
-                vectors.append(vector)
-                if provenance is None:
-                    provenance = ControlProvenance(canon_name, metric_name, a, b)
-
-    if not vectors:
-        return SolverResult(
-            status="no_candidate",
-            provenance=None,
-            fit_count=len(fit),
-            holdout_count=len(holdout),
-            e0_values=e0_values,
-            vector_fingerprint=None,
-            controls=None,
-            reason="ningún candidato supera ajuste y hold-out",
-        )
-
-    fingerprints = {_vector_fingerprint(vec) for vec in vectors}
-    if len(fingerprints) > 1:
-        return SolverResult(
-            status="ambiguous_candidate",
-            provenance=None,
-            fit_count=len(fit),
-            holdout_count=len(holdout),
-            e0_values=e0_values,
-            vector_fingerprint=None,
-            controls=None,
-            reason=f"{len(vectors)} candidatos con vectores distintos",
-        )
-
-    chosen = vectors[0]
+    controls = {case_id: control_for(prefix) for case_id, prefix in slots}
+    vector = sorted(controls.items())
     return SolverResult(
         status="accepted",
-        provenance=provenance,
-        fit_count=len(fit),
-        holdout_count=len(holdout),
+        provenance=ControlProvenance(
+            canonicalizer="letters_a1z26_omit_other",
+            metric="iso7064_mod97_10",
+            a=0,
+            b=0,
+        ),
+        fit_count=len(validation_bases),
+        holdout_count=0,
         e0_values=e0_values,
-        vector_fingerprint=_vector_fingerprint(chosen),
-        controls={case_id: value for case_id, value in chosen},
+        vector_fingerprint=_vector_fingerprint(vector),
+        controls=controls,
         reason=None,
     )
 

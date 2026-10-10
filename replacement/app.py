@@ -2,16 +2,28 @@
 
 La autenticación se evalúa antes del ruteo y clasifica cada solicitud como
 ``valid``, ``missing`` o ``invalid`` sin revelar el valor recibido. Con el
-catálogo listo y credencial válida, ``POST /msg`` responde de forma provisional
-``503`` con el texto literal ``aún no disponible``; el resto de las rutas se
-resuelven con la respuesta de referencia correspondiente.
+catálogo listo y credencial válida, ``POST /msg`` valida el control del pipeline
+genérico (``E201`` si no es numérico, ``E202`` si es numérico inválido) y trata
+``PING`` exacto como caso especial (``200 {"pong":true}`` con aridad 2, ``E302``
+con aridad mayor); un control válido conserva el texto provisional ``503`` con
+``aún no disponible``. El resto de las rutas se resuelven con la respuesta de
+referencia correspondiente.
 """
 
 from __future__ import annotations
 
+import json
+
 from flask import Flask, Response, request
 
-from .references import Catalog, TEXT_CONTENT_TYPE, load_catalog, unavailable_catalog
+from .control import is_numeric, is_valid
+from .references import (
+    JSON_CONTENT_TYPE,
+    Catalog,
+    TEXT_CONTENT_TYPE,
+    load_catalog,
+    unavailable_catalog,
+)
 from .settings import DEFAULT_REFERENCES_PATH, Settings, load_settings
 from .state import TemporaryState
 
@@ -55,6 +67,41 @@ def create_app(settings: Settings, catalog: Catalog, state: TemporaryState | Non
     def blocked(message: str) -> Response:
         return Response(f"base no lista: {message}\n", status=503, content_type=TEXT_CONTENT_TYPE)
 
+    def json_error(code: str, mensaje: str) -> Response:
+        payload = {"error": code, "mensaje": mensaje}
+        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        return Response(body, status=400, content_type=JSON_CONTENT_TYPE)
+
+    def stub() -> Response:
+        return Response(STUB_BODY, status=STUB_STATUS, content_type=TEXT_CONTENT_TYPE)
+
+    def message() -> Response:
+        """Valida el control del pipeline genérico; PING exacto es especial.
+
+        El comando de negocio no se ejecuta en esta fase: un control válido
+        conserva el stub ``503`` actual.
+        """
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get("m"), str):
+            return stub()
+        text = payload["m"]
+        fields = text.split(";")
+        if fields[0] == "PING":
+            if len(fields) == 2:
+                return Response(
+                    '{"pong":true}', status=200, content_type=JSON_CONTENT_TYPE
+                )
+            if len(fields) > 2:
+                return json_error("E302", "aridad inválida")
+            return stub()
+        control = fields[-1]
+        base = text.rpartition(";")[0]
+        if not is_numeric(control):
+            return json_error("E201", "control mal formado")
+        if not is_valid(base, control):
+            return json_error("E202", "control inválido")
+        return stub()
+
     def handle() -> Response:
         auth = classify_auth(request.headers.get("Authorization"), settings.token)
 
@@ -62,7 +109,7 @@ def create_app(settings: Settings, catalog: Catalog, state: TemporaryState | Non
             return blocked(blocked_reason())
 
         if request.method == "POST" and request.path == "/msg" and auth == "valid":
-            return Response(STUB_BODY, status=STUB_STATUS, content_type=TEXT_CONTENT_TYPE)
+            return message()
 
         reference = catalog.resolve(request.method, request.path, auth)
         if reference is None:
