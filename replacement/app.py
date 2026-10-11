@@ -18,9 +18,6 @@ from .references import (
 from .settings import DEFAULT_REFERENCES_PATH, Settings, load_settings
 from .state import TemporaryState
 
-STUB_STATUS = 503
-STUB_BODY = "aún no disponible"
-
 # Métodos estándar atendidos por la ruta catch-all; los no listados se atienden
 # desde los manejadores de error para no emitir respuestas del framework.
 ALL_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD", "TRACE"]
@@ -63,9 +60,6 @@ def create_app(settings: Settings, catalog: Catalog, state: TemporaryState | Non
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         return Response(body, status=400, content_type=JSON_CONTENT_TYPE)
 
-    def stub() -> Response:
-        return Response(STUB_BODY, status=STUB_STATUS, content_type=TEXT_CONTENT_TYPE)
-
     def message() -> Response:
         """Valida el mensaje y delega la ejecución al despachador parcial."""
         payload = request.get_json(silent=True)
@@ -77,8 +71,6 @@ def create_app(settings: Settings, catalog: Catalog, state: TemporaryState | Non
             return json_error("E102", "falta mensaje")
         text = payload["m"]
         if ";" not in text:
-            if text.upper() == "PING":
-                return stub()
             return json_error("E103", "falta control")
         fields = text.split(";")
         if any(field == "" for field in fields):
@@ -93,7 +85,7 @@ def create_app(settings: Settings, catalog: Catalog, state: TemporaryState | Non
                 return Response(
                     '{"pong":true}', status=200, content_type=JSON_CONTENT_TYPE
                 )
-            return stub()
+            return json_error("E103", "falta control")
         control = fields[-1]
         base = text.rpartition(";")[0]
         if not is_numeric(control) or len(control) > 2:

@@ -151,11 +151,11 @@ def test_msg_malformed_control_returns_e201(client):
     assert response.get_json() == {"error": "E201", "mensaje": "control mal formado"}
 
 
-def test_ping_any_numeric_control_returns_pong(client):
-    for control in ("00", "3", "64", "98"):
-        response = client.post("/msg", headers=AUTH, json={"m": f"PING;{control}"})
-        assert response.status_code == 200
-        assert response.get_json() == {"pong": True}
+@pytest.mark.parametrize("message", ["PING;64", "ping;64", "Ping;64"])
+def test_ping_with_control_returns_pong(client, message):
+    response = client.post("/msg", headers=AUTH, json={"m": message})
+    assert response.status_code == 200
+    assert response.get_json() == {"pong": True}
 
 
 @pytest.mark.parametrize("control", ["abc", "123", "１２"])
@@ -171,10 +171,38 @@ def test_ping_extra_arity_returns_e302(client):
     assert response.get_json() == {"error": "E302", "mensaje": "aridad inválida"}
 
 
-def test_ping_single_field_uses_stub(client):
+def test_ping_empty_control_returns_e104(client):
+    response = client.post("/msg", headers=AUTH, json={"m": "PING;"})
+    assert (response.status_code, response.get_json()) == (
+        400, {"error": "E104", "mensaje": "segmento vacío"}
+    )
+
+
+def test_ping_single_field_returns_e103(client):
     response = client.post("/msg", headers=AUTH, json={"m": "PING"})
-    assert response.status_code == 503
-    assert response.get_data(as_text=True) == "aún no disponible"
+    assert (response.status_code, response.get_json()) == (
+        400, {"error": "E103", "mensaje": "falta control"}
+    )
+
+
+def test_rejected_ping_does_not_mutate_balance_or_operation_sequence(client):
+    alta = client.post("/msg", headers=AUTH, json={"m": _message("ALTA;Lucia")})
+    assert alta.get_json() == {"cuentaId": "AC-0001"}
+    first_deposit = client.post(
+        "/msg", headers=AUTH, json={"m": _message("DEPOSITO;AC-0001;1")}
+    )
+    assert first_deposit.get_json() == {"status": "recieved", "operacionId": "OP-0001"}
+
+    rejected = client.post("/msg", headers=AUTH, json={"m": "PING"})
+    assert (rejected.status_code, rejected.get_json()) == (
+        400, {"error": "E103", "mensaje": "falta control"}
+    )
+    balance = client.post("/msg", headers=AUTH, json={"m": _message("CONSULTA;AC-0001")})
+    assert balance.get_json() == {"cuenta_id": "AC-0001", "saldo": "0.01"}
+    second_deposit = client.post(
+        "/msg", headers=AUTH, json={"m": _message("DEPOSITO;AC-0001;1")}
+    )
+    assert second_deposit.get_json() == {"status": "recieved", "operacionId": "OP-0002"}
 
 
 def test_three_digit_control_is_malformed(client):
